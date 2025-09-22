@@ -2,7 +2,7 @@
 
 Prism Player is a simple, lightweight video player built with Rust and the [`tessera-ui`](https://github.com/tessera-ui/tessera) framework. It uses FFmpeg for video decoding.
 
-![preview](image.png)
+![preview](preview.png)
 
 ## Features
 
