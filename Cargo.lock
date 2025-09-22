@@ -2727,9 +2727,9 @@ dependencies = [
 
 [[package]]
 name = "tessera-ui"
-version = "2.0.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70bf125325ddd1d90ca54e59335fb98b09388d2966d8d06289830fb13b694f01"
+checksum = "656731612ee7a5ff27b44b1da381dc0c9a8a196be1e7067d2d3d6a8056b951a8"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -2754,9 +2754,9 @@ dependencies = [
 
 [[package]]
 name = "tessera-ui-basic-components"
-version = "2.0.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbb93d5c78e732048cd2d0198bdf3786cdcc67473c0204a8ca636cbdb13432bb"
+checksum = "ea645029638e70ae163ea59e6e2ebb89aaccd2d6d2198b79bda1f9c2c96019ea"
 dependencies = [
  "bytemuck",
  "derive_builder",
