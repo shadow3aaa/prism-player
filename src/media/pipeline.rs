@@ -1,8 +1,6 @@
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, time::Instant};
 
+use crate::media::clock::GlobalClock;
 use encase::{ShaderType, UniformBuffer};
 use glam::Vec4;
 use tessera_ui::{DrawCommand, DrawablePipeline, wgpu};
@@ -10,7 +8,7 @@ use uuid::Uuid;
 
 #[derive(ShaderType)]
 struct VideoUniforms {
-    rect: Vec4, // x, y, w, h (NDC 或者屏幕归一化)
+    rect: Vec4, // x, y, w, h (normalized device coords or screen-normalized)
 }
 
 struct VideoResources {
@@ -26,23 +24,29 @@ struct VideoResources {
 
 struct VideoTarget {
     pub resources: VideoResources,
-    pub receiver: flume::Receiver<Vec<u8>>,
-    pub last_frame_time: Instant,
-    pub frame_duration: Duration,
+    pub receiver: flume::Receiver<(Vec<u8>, f64)>,
     updated: bool,
+    // scheduling driven by presentation timestamps (PTS)
+    pub first_pts: Option<f64>,
+    pub first_instant: Option<Instant>,
+    pub last_pts_seconds: Option<f64>,
+    // per-target clock for independent timing/control
+    pub clock: GlobalClock,
+    // single-frame slot to avoid pipeline-side buffering
+    pub next_frame_slot: Option<(Vec<u8>, f64)>,
 }
 
 impl VideoTarget {
     fn new(
         gpu: &wgpu::Device,
         config: &wgpu::SurfaceConfiguration,
-        receiver: flume::Receiver<Vec<u8>>,
+        receiver: flume::Receiver<(Vec<u8>, f64)>,
         sample_count: u32,
         width: u32,
         height: u32,
-        frame_duration: Duration,
+        clock: GlobalClock,
     ) -> Self {
-        // 创建纹理
+        // create texture used as the video render target
         let texture = gpu.create_texture(&wgpu::TextureDescriptor {
             label: Some("video texture"),
             size: wgpu::Extent3d {
@@ -67,7 +71,7 @@ impl VideoTarget {
         let bind_group_layout = gpu.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("video bind group layout"),
             entries: &[
-                // texture
+                // texture binding for sampling video pixels
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -78,14 +82,14 @@ impl VideoTarget {
                     },
                     count: None,
                 },
-                // sampler
+                // sampler for texture sampling
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                // uniforms
+                // uniform buffer for vertex and fragment shaders
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
@@ -173,9 +177,12 @@ impl VideoTarget {
         Self {
             resources,
             receiver,
-            last_frame_time: Instant::now(),
-            frame_duration,
             updated: false,
+            first_pts: None,
+            first_instant: None,
+            clock,
+            next_frame_slot: None,
+            last_pts_seconds: None,
         }
     }
 }
@@ -199,14 +206,14 @@ pub struct VideoCommand {
     pub id: Uuid,
     pub width: u32,
     pub height: u32,
-    pub frame_duration: Duration,
-    pub receiver: flume::Receiver<Vec<u8>>,
+    pub receiver: flume::Receiver<(Vec<u8>, f64)>,
+    pub clock: GlobalClock,
 }
 
 impl PartialEq for VideoCommand {
     fn eq(&self, other: &Self) -> bool {
-        // 首先比较 ID，确认是同一个播放目标，其次确保接收器为空（表示缓冲区渲染的帧已经消费完毕）
-        self.id == other.id && self.receiver.is_empty()
+        // compare id to ensure same playback target; require clock to be paused to avoid race conditions
+        self.id == other.id && self.clock.is_paused()
     }
 }
 
@@ -219,34 +226,59 @@ impl DrawablePipeline<VideoCommand> for VideoPipeline {
         gpu_queue: &tessera_ui::wgpu::Queue,
         _config: &tessera_ui::wgpu::SurfaceConfiguration,
     ) {
-        // 更新视频帧
+        // update video frames based on shared clock and single-frame slot to avoid buffering
+        const TOLERANCE_SHOW: f64 = 0.03; // seconds
+        const DROP_THRESHOLD: f64 = 0.15; // seconds
+
         for target in self.video_targets.values_mut() {
-            if target.last_frame_time.elapsed() >= target.frame_duration
-                && let Ok(frame_data) = target.receiver.try_recv()
+            let now = target.clock.now();
+
+            // fill single-frame slot to hold the next frame for scheduling decisions
+            if target.next_frame_slot.is_none()
+                && let Ok((frame_data, pts)) = target.receiver.try_recv()
             {
-                gpu_queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: target.resources.texture_view.texture(),
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &frame_data,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(
-                            4 * target.resources.texture_view.texture().size().width,
-                        ),
-                        rows_per_image: None,
-                    },
-                    wgpu::Extent3d {
-                        width: target.resources.texture_view.texture().size().width,
-                        height: target.resources.texture_view.texture().size().height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-                target.last_frame_time = Instant::now();
-                target.updated = true;
+                target.next_frame_slot = Some((frame_data, pts));
+            }
+
+            // Evaluate slot by temporarily taking it to avoid simultaneous borrows
+            if let Some(slot) = target.next_frame_slot.take() {
+                let (frame_data, pts_seconds) = slot;
+                // decide whether to show, drop, or wait for the correct display time
+                if pts_seconds <= now + TOLERANCE_SHOW {
+                    // show frame
+                    gpu_queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: target.resources.texture_view.texture(),
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &frame_data,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(
+                                4 * target.resources.texture_view.texture().size().width,
+                            ),
+                            rows_per_image: None,
+                        },
+                        wgpu::Extent3d {
+                            width: target.resources.texture_view.texture().size().width,
+                            height: target.resources.texture_view.texture().size().height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    target.updated = true;
+                    target.last_pts_seconds = Some(pts_seconds);
+                    if target.first_pts.is_none() {
+                        target.first_pts = Some(pts_seconds);
+                        target.first_instant = Some(Instant::now());
+                    }
+                } else if pts_seconds < now - DROP_THRESHOLD {
+                    // drop stale frame to avoid excessive latency
+                } else {
+                    // future frame: put it back and wait until its presentation time
+                    target.next_frame_slot = Some((frame_data, pts_seconds));
+                }
             }
         }
     }
@@ -263,7 +295,7 @@ impl DrawablePipeline<VideoCommand> for VideoPipeline {
     ) {
         for (cmd, size, pos) in commands {
             if !self.video_targets.contains_key(&cmd.id) {
-                // 创建新的 VideoTarget
+                // create a new VideoTarget to manage per-target resources and timing
                 let rx = cmd.receiver.clone();
                 self.video_targets.insert(
                     cmd.id,
@@ -274,12 +306,12 @@ impl DrawablePipeline<VideoCommand> for VideoPipeline {
                         self.sample_count,
                         cmd.width,
                         cmd.height,
-                        cmd.frame_duration,
+                        cmd.clock.clone(),
                     ),
                 );
             }
 
-            // 采样视频纹理到绘制目标
+            // sample video texture into the render target for drawing
             let target = self.video_targets.get_mut(&cmd.id).unwrap();
             render_pass.set_pipeline(&target.resources.pipeline);
             let uniforms = VideoUniforms {
@@ -294,7 +326,7 @@ impl DrawablePipeline<VideoCommand> for VideoPipeline {
             buffer.write(&uniforms).unwrap();
             gpu_queue.write_buffer(&target.resources.uniform_buffer, 0, &buffer.into_inner());
             render_pass.set_bind_group(0, &target.resources.bind_group, &[]);
-            render_pass.draw(0..6, 0..1); // 两个三角形矩形
+            render_pass.draw(0..6, 0..1); // two triangles forming a rectangle
         }
     }
 }

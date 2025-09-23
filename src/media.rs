@@ -1,3 +1,7 @@
+pub mod clock;
+mod decoder;
+pub mod pipeline;
+
 use std::{
     mem,
     sync::{Arc, mpsc},
@@ -5,13 +9,11 @@ use std::{
     time::Duration,
 };
 
+use crate::audio::player as audio_player;
 use ffmpeg_next::{self as ffmpeg};
 use parking_lot::RwLock;
 use tessera_ui::{ComputedData, Constraint, DimensionValue, tessera};
 use uuid::Uuid;
-
-mod decoder;
-pub mod pipeline;
 
 pub struct VideoPlayerArgs {
     pub width: DimensionValue,
@@ -20,25 +22,25 @@ pub struct VideoPlayerArgs {
 
 enum DecodeThreadCommand {
     Exit,
-    Pause,
-    Resume,
 }
 
 pub struct VideoPlayerState {
     id: Uuid,
     width: u32,
     height: u32,
-    frame_duration: Duration,
     decode_thread: Option<thread::JoinHandle<()>>,
     sx_commander: mpsc::Sender<DecodeThreadCommand>,
-    rx_data: flume::Receiver<Vec<u8>>,
+    rx_data: flume::Receiver<(Vec<u8>, f64)>,
     playing: bool,
+    clock: clock::GlobalClock,
+    #[allow(unused)]
+    audio_handle: audio_player::AudioHandle,
 }
 
 impl Drop for VideoPlayerState {
     fn drop(&mut self) {
-        self.rx_data.drain(); // Clear the channel
-        let _ = self.sx_commander.send(DecodeThreadCommand::Resume); // Ensure it's not paused
+        // clear buffered frames so the decoder thread can exit without blocking
+        self.rx_data.drain();
         let _ = self.sx_commander.send(DecodeThreadCommand::Exit);
         self.decode_thread.take().unwrap().join().unwrap();
     }
@@ -47,18 +49,15 @@ impl Drop for VideoPlayerState {
 impl VideoPlayerState {
     pub fn new(path: &str) -> Self {
         let (sx_commander, rx_commander) = mpsc::channel();
-        let (sx_data, rx_data) = flume::bounded(30); // Buffer up to 30 frames
+        // buffer up to 30 frames to smooth producer/consumer bursts
+        let (sx_data, rx_data) = flume::bounded(30);
         let path = path.to_string();
-        let decoder = decoder::VideoDecoder::new(&path).expect("Failed to open video");
+        let decoder = decoder::VideoDecoder::new(&path);
         let width = decoder.width();
         let height = decoder.height();
-        let frame_rate = decoder.frame_rate().expect("Failed to get frame rate");
-        let frame_duration = Duration::from_secs_f64(
-            frame_rate.denominator() as f64 / frame_rate.numerator() as f64,
-        );
 
-        let rx_data_clone = rx_data.clone();
         let decode_thread = thread::spawn(move || {
+            let timebase_f64: f64 = decoder.time_base().into();
             let mut scaler = ffmpeg::software::scaling::Context::get(
                 decoder.format(),
                 decoder.width(),
@@ -71,83 +70,68 @@ impl VideoPlayerState {
             .expect("Failed to create video scaler");
             let mut scaled_frame = ffmpeg::util::frame::Video::empty();
             for frame in decoder {
+                // poll exit command to allow responsive shutdown
                 while let Ok(cmd) = rx_commander.try_recv() {
                     match cmd {
                         DecodeThreadCommand::Exit => return,
-                        DecodeThreadCommand::Pause => {
-                            // Take all frames from the channel to avoid delays when resuming
-                            let datas = rx_data_clone.drain();
-
-                            while let Ok(cmd) = rx_commander.recv() {
-                                if let DecodeThreadCommand::Resume = cmd {
-                                    // Put back all frames to the channel
-                                    for data in datas {
-                                        let _ = sx_data.send(data);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        DecodeThreadCommand::Resume => {}
                     }
                 }
                 scaler
                     .run(&frame, &mut scaled_frame)
                     .expect("Failed to scale frame");
                 let mut data = scaled_frame.data(0).to_vec();
-                while let Err(e) =
-                    sx_data.send_timeout(mem::take(&mut data), Duration::from_millis(100))
-                {
+
+                // convert frame pts to seconds for timing and scheduling
+                let mut pts_seconds = frame.pts().map(|p| p as f64 * timebase_f64).unwrap();
+                while let Err(e) = sx_data.send_timeout(
+                    (mem::take(&mut data), pts_seconds),
+                    Duration::from_millis(100),
+                ) {
                     match e {
-                        flume::SendTimeoutError::Timeout(unsent_data) => {
-                            // Check if the thread should pause or exit
-                            while let Ok(cmd) = rx_commander.try_recv() {
+                        flume::SendTimeoutError::Timeout((unsent_data, unsent_pts)) => {
+                            // check for exit to allow prompt shutdown; preserve pts and data for resend
+                            if let Ok(cmd) = rx_commander.try_recv() {
                                 match cmd {
                                     DecodeThreadCommand::Exit => return,
-                                    DecodeThreadCommand::Pause => {
-                                        // Take all frames from the channel to avoid delays when resuming
-                                        let datas = rx_data_clone.drain();
-
-                                        while let Ok(cmd) = rx_commander.recv() {
-                                            if let DecodeThreadCommand::Resume = cmd {
-                                                // Put back all frames to the channel
-                                                for data in datas {
-                                                    let _ = sx_data.send(data);
-                                                }
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    DecodeThreadCommand::Resume => {}
                                 }
                             }
                             data = unsent_data;
+                            pts_seconds = unsent_pts;
                         }
-                        flume::SendTimeoutError::Disconnected(_) => todo!(),
+                        flume::SendTimeoutError::Disconnected(_) => return,
                     }
                 }
             }
         });
 
+        // create shared clock so audio and video share the same timing reference
+        let clock = clock::GlobalClock::new();
+
+        // spawn audio playback (best-effort)
+        let audio_handle = audio_player::spawn_audio(path.to_string(), clock.clone());
+
         Self {
             width,
             height,
-            frame_duration,
             id: Uuid::new_v4(),
             decode_thread: Some(decode_thread),
             sx_commander,
             rx_data,
             playing: true,
+            clock,
+            audio_handle,
         }
     }
 
     pub fn pause(&mut self) {
-        let _ = self.sx_commander.send(DecodeThreadCommand::Pause);
+        // pause shared clock to stop playback timing
+        self.clock.pause();
         self.playing = false;
     }
 
     pub fn resume(&mut self) {
-        let _ = self.sx_commander.send(DecodeThreadCommand::Resume);
+        // resume shared clock to continue playback timing
+        self.clock.resume();
         self.playing = true;
     }
 
@@ -173,8 +157,8 @@ pub fn video_player(args: VideoPlayerArgs, state: Arc<RwLock<VideoPlayerState>>)
                 id: state.read().id,
                 width: state.read().width,
                 height: state.read().height,
-                frame_duration: state.read().frame_duration,
                 receiver: state.read().rx_data.clone(),
+                clock: state.read().clock.clone(),
             });
         let size = Constraint::new(args.width, args.height).merge(input.parent_constraint);
         Ok(ComputedData {

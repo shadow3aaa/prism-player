@@ -21,3 +21,6 @@ glam = "0.30.7"
 uuid = { version = "1.18.1", features = ["v4"] }
 flume = "0.11.1"
 clap = { version = "4.5.48", features = ["derive"] }
+rodio = "0.21.1"
+cpal = "0.16.0"
+ringbuf = "0.2"

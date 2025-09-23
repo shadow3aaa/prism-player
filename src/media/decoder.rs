@@ -1,33 +1,44 @@
 use ffmpeg_next::{self as ffmpeg, util::frame::Video as FrameVideo};
+use tracing::error;
 
 pub struct VideoDecoder {
     ictx: ffmpeg::format::context::Input,
     stream_index: usize,
     decoder: ffmpeg::codec::decoder::Video,
     sent_eof: bool,
+    time_base: ffmpeg::Rational,
 }
 
 impl VideoDecoder {
-    pub fn new(path: &str) -> Result<Self, ffmpeg::Error> {
-        // 初始化 ffmpeg，这步很重要，最好在应用启动时调用一次
-        ffmpeg::init().unwrap();
+    pub fn new(path: &str) -> Self {
+        // open input file; panic on failure because caller cannot recover at this layer
+        let ictx = ffmpeg::format::input(path).expect("Failed to open input file");
 
-        let ictx = ffmpeg::format::input(path)?;
+        // ensure a video stream exists; panic if missing because higher layers cannot recover
         let stream = ictx
             .streams()
             .best(ffmpeg::media::Type::Video)
-            .ok_or(ffmpeg::Error::StreamNotFound)?;
+            .expect("no video stream found in input (unsupported format)");
         let stream_index = stream.index();
-        let context_decoder =
-            ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
-        let decoder = context_decoder.decoder().video()?;
+        let time_base = stream.time_base();
 
-        Ok(VideoDecoder {
+        // build codec context; panic on invalid stream parameters since this indicates unrecoverable input
+        let context_decoder = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+            .expect("failed to build codec context from stream parameters");
+
+        // obtain video decoder; panic if unsupported because higher layers cannot recover
+        let decoder = context_decoder
+            .decoder()
+            .video()
+            .expect("failed to obtain video decoder (unsupported codec)");
+
+        VideoDecoder {
             ictx,
             stream_index,
             decoder,
             sent_eof: false,
-        })
+            time_base,
+        }
     }
 
     pub fn width(&self) -> u32 {
@@ -38,12 +49,12 @@ impl VideoDecoder {
         self.decoder.height()
     }
 
-    pub fn frame_rate(&self) -> Option<ffmpeg::Rational> {
-        self.decoder.frame_rate()
-    }
-
     pub fn format(&self) -> ffmpeg::format::Pixel {
         self.decoder.format()
+    }
+
+    pub fn time_base(&self) -> ffmpeg::Rational {
+        self.time_base
     }
 }
 
@@ -54,42 +65,42 @@ impl Iterator for VideoDecoder {
         let mut decoded_frame = FrameVideo::empty();
 
         loop {
-            // 1. 尝试从解码器接收一帧
+            // try receiving a frame from the decoder
             match self.decoder.receive_frame(&mut decoded_frame) {
                 Ok(()) => {
                     return Some(decoded_frame);
                 }
                 Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::sys::EAGAIN => {
-                    // 解码器需要更多数据包，继续下面的逻辑
+                    // decoder needs more packets; continue to packet reading logic
                 }
                 Err(ffmpeg::Error::Eof) => {
-                    // 流已结束，返回 None
+                    // stream ended; return None
                     return None;
                 }
                 Err(e) => {
-                    // 发生其他错误
-                    eprintln!("解码错误: {:?}", e);
+                    // other error during decode; report and return None
+                    error!("decode error: {:?}", e);
                     return None;
                 }
             }
 
-            // 2. 如果已发送 EOF，说明正在冲刷解码器，不再发送新包
+            // if EOF already sent we are flushing the decoder; do not send new packets
             if self.sent_eof {
                 continue;
             }
 
-            // 3. 读取下一个数据包
+            // read next packet from input
             if let Some((stream, packet)) = self.ictx.packets().next() {
                 if stream.index() == self.stream_index
                     && let Err(e) = self.decoder.send_packet(&packet)
                 {
-                    eprintln!("发送包时出错: {:?}", e);
+                    error!("error sending packet: {:?}", e);
                     return None;
                 }
             } else {
-                // 4. 数据包读取完毕，发送一个空包以冲刷解码器
+                // no more packets; send EOF to flush the decoder
                 if let Err(e) = self.decoder.send_eof() {
-                    eprintln!("发送 EOF 时出错: {:?}", e);
+                    error!("error sending EOF: {:?}", e);
                     return None;
                 }
                 self.sent_eof = true;

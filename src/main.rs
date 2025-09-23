@@ -1,5 +1,6 @@
+mod audio;
 mod color;
-mod video;
+mod media;
 
 use std::sync::Arc;
 
@@ -16,14 +17,15 @@ use tessera_ui_basic_components::{
     alignment::Alignment,
     boxed::{BoxedArgs, boxed},
     fluid_glass::{FluidGlassArgs, fluid_glass},
+    shape_def::Shape,
     surface::{SurfaceArgs, surface},
-    text::text,
+    text::{TextArgs, text},
 };
 use tracing::error;
 
 use crate::{
     color::BACKGROUND_COLOR,
-    video::{VideoPlayerArgs, VideoPlayerState, pipeline::VideoPipeline, video_player},
+    media::{VideoPlayerArgs, VideoPlayerState, pipeline::VideoPipeline, video_player},
 };
 
 /// Simple video player application
@@ -37,7 +39,7 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    ffmpeg_next::init().unwrap();
+    ffmpeg_next::init().expect("Failed to initialize ffmpeg");
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .or_else(|_| {
             tracing_subscriber::EnvFilter::try_new("off,prism_player=info,tessera_ui=info")
@@ -104,6 +106,8 @@ fn app(#[state] state: AppState, video_player_state: Arc<RwLock<VideoPlayerState
                                     refraction_height: 50.0,
                                     refraction_amount: 100.0,
                                     blur_radius: 30.0,
+                                    shape: Shape::rounded_rectangle(Dp(25.0)),
+                                    tint_color: Color::WHITE.with_alpha(0.1),
                                     ..Default::default()
                                 },
                                 None,
@@ -116,7 +120,12 @@ fn app(#[state] state: AppState, video_player_state: Arc<RwLock<VideoPlayerState
                                         },
                                         |scope| {
                                             scope.child(|| {
-                                                text("Play");
+                                                text(TextArgs {
+                                                    text: "Paused".into(),
+                                                    size: Dp(24.0),
+                                                    color: Color::WHITE,
+                                                    ..Default::default()
+                                                });
                                             });
                                         },
                                     );
