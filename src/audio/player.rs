@@ -98,15 +98,10 @@ pub fn spawn_audio(path: String, clock: GlobalClock) -> AudioHandle {
                 };
                 let out_rate = target_sample_rate;
 
-                match ffmpeg::software::resampling::Context::get(
+                resampler = Some(ffmpeg::software::resampling::Context::get(
                     in_format, in_layout, in_rate, out_format, out_layout, out_rate,
-                ) {
-                    Ok(ctx) => resampler = Some(ctx),
-                    Err(e) => {
-                        error!("Failed to create resampler: {:?}", e);
-                        break;
-                    }
-                }
+                )
+                .expect("Failed to create resampler"));
             }
 
             if let Some(ref mut r) = resampler {
